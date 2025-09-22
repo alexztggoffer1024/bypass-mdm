@@ -11,7 +11,7 @@ NC='\033[0m'
 
 # Function to get the system volume name
 get_system_volume() {
-    system_volume=$(diskutil info / | grep "Device Node" | awk -F': ' '{print $2}' | xargs diskutil info | grep "Volume Name" | awk -F': ' '{print $2}' | tr -d ' ')
+    system_volume=$(diskutil info / | grep "Device Node" | awk -F': *' '{print $2}' | xargs diskutil info | awk -F': *' '/Volume Name/ {print $2; exit}')
     echo "$system_volume"
 }
 
@@ -45,16 +45,35 @@ select opt in "${options[@]}"; do
 
             # Create User
             dscl_path='/Volumes/Data/private/var/db/dslocal/nodes/Default'
+            # Ensure username does not already exist; if it does, append a numeric suffix
+            if dscl -f "$dscl_path" localhost -read "/Local/Default/Users/$username" >/dev/null 2>&1; then
+                base_username="$username"
+                suffix=1
+                while dscl -f "$dscl_path" localhost -read "/Local/Default/Users/$username" >/dev/null 2>&1; do
+                    username="${base_username}${suffix}"
+                    suffix=$((suffix+1))
+                done
+                echo -e "${YEL}Username exists. Using '$username' instead.${NC}"
+            fi
+
+            # Find an available UniqueID starting at 501
+            existing_uids=$(dscl -f "$dscl_path" localhost -list "/Local/Default/Users" UniqueID 2>/dev/null | awk '{print $2}')
+            target_uid=501
+            if [ -n "$existing_uids" ]; then
+                while echo "$existing_uids" | grep -qx "$target_uid"; do
+                    target_uid=$((target_uid+1))
+                done
+            fi
             echo -e "${GREEN}Creating Temporary User"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" UserShell "/bin/zsh"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" RealName "$realName"
-            dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" UniqueID "501"
+            dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" UniqueID "$target_uid"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" PrimaryGroupID "20"
             mkdir "/Volumes/Data/Users/$username"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" NFSHomeDirectory "/Users/$username"
             dscl -f "$dscl_path" localhost -passwd "/Local/Default/Users/$username" "$passw"
-            dscl -f "$dscl_path" localhost -append "/Local/Default/Groups/admin" GroupMembership $username
+            dscl -f "$dscl_path" localhost -append "/Local/Default/Groups/admin" GroupMembership "$username"
 
             # Block MDM domains
             echo "0.0.0.0 deviceenrollment.apple.com" >>/Volumes/"$system_volume"/etc/hosts
