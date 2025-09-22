@@ -66,6 +66,10 @@ select opt in "${options[@]}"; do
             fi
             echo -e "${GREEN}Creating Temporary User"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username"
+            # Assign RecordName and GeneratedUID so the user is properly recognized by loginwindow
+            dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" RecordName "$username"
+            generated_guid=$(uuidgen)
+            dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" GeneratedUID "$generated_guid"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" UserShell "/bin/zsh"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" RealName "$realName"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" UniqueID "$target_uid"
@@ -73,20 +77,24 @@ select opt in "${options[@]}"; do
             mkdir "/Volumes/Data/Users/$username"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" NFSHomeDirectory "/Users/$username"
             dscl -f "$dscl_path" localhost -passwd "/Local/Default/Users/$username" "$passw"
+            # Add to admin both by short name and GUID to satisfy different membership checks
             dscl -f "$dscl_path" localhost -append "/Local/Default/Groups/admin" GroupMembership "$username"
+            dscl -f "$dscl_path" localhost -append "/Local/Default/Groups/admin" GroupMembers "$generated_guid"
+            # Ensure home directory ownership is correct
+            chown -R "$target_uid:20" "/Volumes/Data/Users/$username"
 
-            # Block MDM domains
-            echo "0.0.0.0 deviceenrollment.apple.com" >>/Volumes/"$system_volume"/etc/hosts
-            echo "0.0.0.0 mdmenrollment.apple.com" >>/Volumes/"$system_volume"/etc/hosts
-            echo "0.0.0.0 iprofiles.apple.com" >>/Volumes/"$system_volume"/etc/hosts
+            # Block MDM domains on target Data volume
+            echo "0.0.0.0 deviceenrollment.apple.com" >>/Volumes/Data/etc/hosts
+            echo "0.0.0.0 mdmenrollment.apple.com" >>/Volumes/Data/etc/hosts
+            echo "0.0.0.0 iprofiles.apple.com" >>/Volumes/Data/etc/hosts
             echo -e "${GRN}Successfully blocked MDM & Profile Domains"
 
-            # Remove configuration profiles
+            # Remove configuration profiles on target Data volume
             touch /Volumes/Data/private/var/db/.AppleSetupDone
-            rm -rf /Volumes/"$system_volume"/var/db/ConfigurationProfiles/Settings/.cloudConfigHasActivationRecord
-            rm -rf /Volumes/"$system_volume"/var/db/ConfigurationProfiles/Settings/.cloudConfigRecordFound
-            touch /Volumes/"$system_volume"/var/db/ConfigurationProfiles/Settings/.cloudConfigProfileInstalled
-            touch /Volumes/"$system_volume"/var/db/ConfigurationProfiles/Settings/.cloudConfigRecordNotFound
+            rm -rf /Volumes/Data/var/db/ConfigurationProfiles/Settings/.cloudConfigHasActivationRecord
+            rm -rf /Volumes/Data/var/db/ConfigurationProfiles/Settings/.cloudConfigRecordFound
+            touch /Volumes/Data/var/db/ConfigurationProfiles/Settings/.cloudConfigProfileInstalled
+            touch /Volumes/Data/var/db/ConfigurationProfiles/Settings/.cloudConfigRecordNotFound
 
             echo -e "${GRN}MDM enrollment has been bypassed!${NC}"
             echo -e "${NC}Exit terminal and reboot your Mac.${NC}"
