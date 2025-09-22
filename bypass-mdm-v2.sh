@@ -173,7 +173,17 @@ select opt in "${options[@]}"; do
 			log_info "username=$username realName=$realName uid=$target_uid guid=$generated_guid"
             mkdir -p "$data_volume_path/Users/$username"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" NFSHomeDirectory "/Users/$username"
-            dscl -f "$dscl_path" localhost -passwd "/Local/Default/Users/$username" "$passw"
+            # Set password; if it fails, enable ShadowHash auth and relax policy, then retry
+            if ! dscl -f "$dscl_path" localhost -passwd "/Local/Default/Users/$username" "$passw"; then
+                echo -e "${YEL}dscl -passwd failed. Enabling ShadowHash auth and retrying...${NC}"
+                dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" AuthenticationAuthority ";ShadowHash;" >/dev/null 2>&1
+                dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" PasswordPolicyOptions "usingHistory=0 minChars=1 requiresAlpha=0 requiresNumeric=0" >/dev/null 2>&1
+                if ! dscl -f "$dscl_path" localhost -passwd "/Local/Default/Users/$username" "$passw"; then
+                    echo -e "${RED}Password set failed again (eDSOperationFailed). You may need to reset it after boot using 'passwd' or 'sysadminctl'.${NC}"
+                else
+                    echo -e "${GRN}Password set after enabling ShadowHash.${NC}"
+                fi
+            fi
             # Add to admin both by short name and GUID to satisfy different membership checks
             dscl -f "$dscl_path" localhost -append "/Local/Default/Groups/admin" GroupMembership "$username"
             dscl -f "$dscl_path" localhost -append "/Local/Default/Groups/admin" GroupMembers "$generated_guid"
