@@ -9,10 +9,76 @@ PUR='\033[1;35m'
 CYAN='\033[1;36m'
 NC='\033[0m'
 
-# Function to get the system volume name
+# Function to get the system volume name (as shown under /Volumes)
 get_system_volume() {
-    system_volume=$(diskutil info / | grep "Device Node" | awk -F': *' '{print $2}' | xargs diskutil info | awk -F': *' '/Volume Name/ {print $2; exit}')
+    system_volume=$(diskutil info / | awk -F': *' '/Volume Name/ {print $2; exit}')
     echo "$system_volume"
+}
+
+# Function to get the corresponding Data volume path without renaming
+get_data_volume_path() {
+    local sysvol="$1"
+    local datavol="/Volumes/${sysvol} - Data"
+    if [ -d "$datavol" ]; then
+        echo "$datavol"
+    elif [ -d "/Volumes/Data" ]; then
+        echo "/Volumes/Data"
+    else
+        echo "" 
+    fi
+}
+
+# Try to auto-discover a mounted system Data volume by presence of dslocal
+find_data_volume_candidate() {
+    local candidates=()
+    for v in /Volumes/*; do
+        if [ -d "$v/private/var/db/dslocal/nodes/Default" ]; then
+            candidates+=("$v")
+        fi
+    done
+    if [ ${#candidates[@]} -eq 1 ]; then
+        echo "${candidates[0]}"
+        return
+    fi
+    # Prefer volumes whose name ends with " - Data"
+    for v in "${candidates[@]}"; do
+        case "$(basename "$v")" in
+            *" - Data") echo "$v"; return ;;
+        esac
+    done
+    if [ ${#candidates[@]} -gt 0 ]; then
+        echo "${candidates[0]}"
+        return
+    fi
+    echo ""
+}
+
+# Ensure the chosen Data volume is writable; try unlocking if needed
+ensure_writable_data_volume() {
+    local path="$1"
+    if touch "$path/.bypass_mdm_write_test" >/dev/null 2>&1; then
+        rm -f "$path/.bypass_mdm_write_test"
+        echo "$path"
+        return 0
+    fi
+    local dev_id
+    dev_id=$(diskutil info "$path" 2>/dev/null | awk -F': *' '/Device Identifier/ {print $2; exit}')
+    if [ -n "$dev_id" ]; then
+        echo -n "Volume appears locked or read-only. Enter FileVault passphrase to unlock (leave empty to skip): "
+        read -r -s fvpass
+        echo ""
+        if [ -n "$fvpass" ]; then
+            if diskutil apfs unlockVolume "$dev_id" -passphrase "$fvpass" >/dev/null 2>&1; then
+                if touch "$path/.bypass_mdm_write_test" >/dev/null 2>&1; then
+                    rm -f "$path/.bypass_mdm_write_test"
+                    echo "$path"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+    echo ""
+    return 1
 }
 
 # Get the system volume name
@@ -30,8 +96,23 @@ select opt in "${options[@]}"; do
         "Bypass MDM from Recovery")
             # Bypass MDM from Recovery
             echo -e "${YEL}Bypass MDM from Recovery"
-            if [ -d "/Volumes/$system_volume - Data" ]; then
-                diskutil rename "$system_volume - Data" "Data"
+            data_volume_path=$(find_data_volume_candidate)
+            if [ -z "$data_volume_path" ]; then
+                data_volume_path=$(get_data_volume_path "$system_volume")
+            fi
+            if [ -z "$data_volume_path" ]; then
+                echo -e "${RED}Could not locate Data volume for '$system_volume'. Ensure the target disk is mounted.${NC}"
+                break
+            fi
+            # Validate this is a target system Data volume and it is writable
+            if [ ! -d "$data_volume_path/private/var/db/dslocal/nodes/Default" ]; then
+                echo -e "${RED}$data_volume_path does not look like a macOS system Data volume (dslocal missing). Mount the installed system's Data volume (e.g., 'Macintosh HD - Data') and try again.${NC}"
+                break
+            fi
+            writable_path=$(ensure_writable_data_volume "$data_volume_path")
+            if [ -z "$writable_path" ]; then
+                echo -e "${RED}$data_volume_path is not writable. Unlock or mount as read-write, then rerun.${NC}"
+                break
             fi
 
             # Create Temporary User
@@ -44,7 +125,7 @@ select opt in "${options[@]}"; do
             passw="${passw:=1234}"
 
             # Create User
-            dscl_path='/Volumes/Data/private/var/db/dslocal/nodes/Default'
+            dscl_path="$data_volume_path/private/var/db/dslocal/nodes/Default"
             # Ensure username does not already exist; if it does, append a numeric suffix
             if dscl -f "$dscl_path" localhost -read "/Local/Default/Users/$username" >/dev/null 2>&1; then
                 base_username="$username"
@@ -74,27 +155,35 @@ select opt in "${options[@]}"; do
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" RealName "$realName"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" UniqueID "$target_uid"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" PrimaryGroupID "20"
-            mkdir "/Volumes/Data/Users/$username"
+            mkdir -p "$data_volume_path/Users/$username"
             dscl -f "$dscl_path" localhost -create "/Local/Default/Users/$username" NFSHomeDirectory "/Users/$username"
             dscl -f "$dscl_path" localhost -passwd "/Local/Default/Users/$username" "$passw"
             # Add to admin both by short name and GUID to satisfy different membership checks
             dscl -f "$dscl_path" localhost -append "/Local/Default/Groups/admin" GroupMembership "$username"
             dscl -f "$dscl_path" localhost -append "/Local/Default/Groups/admin" GroupMembers "$generated_guid"
             # Ensure home directory ownership is correct
-            chown -R "$target_uid:20" "/Volumes/Data/Users/$username"
+            chown -R "$target_uid:20" "$data_volume_path/Users/$username"
 
             # Block MDM domains on target Data volume
-            echo "0.0.0.0 deviceenrollment.apple.com" >>/Volumes/Data/etc/hosts
-            echo "0.0.0.0 mdmenrollment.apple.com" >>/Volumes/Data/etc/hosts
-            echo "0.0.0.0 iprofiles.apple.com" >>/Volumes/Data/etc/hosts
-            echo -e "${GRN}Successfully blocked MDM & Profile Domains"
+            hosts_file="$data_volume_path/etc/hosts"
+            if [ ! -f "$hosts_file" ] && [ -f "$data_volume_path/private/etc/hosts" ]; then
+                hosts_file="$data_volume_path/private/etc/hosts"
+            fi
+            if [ -f "$hosts_file" ]; then
+                echo "0.0.0.0 deviceenrollment.apple.com" >>"$hosts_file"
+                echo "0.0.0.0 mdmenrollment.apple.com" >>"$hosts_file"
+                echo "0.0.0.0 iprofiles.apple.com" >>"$hosts_file"
+                echo -e "${GRN}Successfully blocked MDM & Profile Domains"
+            else
+                echo -e "${YEL}Hosts file not found under $data_volume_path; skipping domain block${NC}"
+            fi
 
             # Remove configuration profiles on target Data volume
-            touch /Volumes/Data/private/var/db/.AppleSetupDone
-            rm -rf /Volumes/Data/var/db/ConfigurationProfiles/Settings/.cloudConfigHasActivationRecord
-            rm -rf /Volumes/Data/var/db/ConfigurationProfiles/Settings/.cloudConfigRecordFound
-            touch /Volumes/Data/var/db/ConfigurationProfiles/Settings/.cloudConfigProfileInstalled
-            touch /Volumes/Data/var/db/ConfigurationProfiles/Settings/.cloudConfigRecordNotFound
+            touch "$data_volume_path/private/var/db/.AppleSetupDone"
+            rm -rf "$data_volume_path/var/db/ConfigurationProfiles/Settings/.cloudConfigHasActivationRecord"
+            rm -rf "$data_volume_path/var/db/ConfigurationProfiles/Settings/.cloudConfigRecordFound"
+            touch "$data_volume_path/var/db/ConfigurationProfiles/Settings/.cloudConfigProfileInstalled"
+            touch "$data_volume_path/var/db/ConfigurationProfiles/Settings/.cloudConfigRecordNotFound"
 
             echo -e "${GRN}MDM enrollment has been bypassed!${NC}"
             echo -e "${NC}Exit terminal and reboot your Mac.${NC}"
